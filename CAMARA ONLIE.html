@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecuCam - Emisor Avanzado</title>
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <style>
+        body {
+            margin: 0; background: #0a0a0f; color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex;
+            flex-direction: column; align-items: center; min-height: 100vh; padding: 20px; box-sizing: border-box;
+        }
+        .container { width: 100%; max-width: 500px; display: flex; flex-direction: column; gap: 15px; }
+        h2 { text-align: center; margin-bottom: 5px; color: #d4ff3a; font-weight: 700; letter-spacing: -0.5px; }
+        video { width: 100%; aspect-ratio: 4/3; background: #000; border-radius: 20px; object-fit: cover; border: 1px solid #222230; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        .panel { background: #14141c; padding: 20px; border-radius: 20px; border: 1px solid #222230; display: flex; flex-direction: column; gap: 12px; }
+        label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: #8a8a99; letter-spacing: 0.5px; }
+        input, select { background: #1c1c26; border: 1px solid #2a2a3c; padding: 12px; border-radius: 12px; color: #fff; font-size: 16px; font-weight: bold; }
+        input { text-align: center; text-transform: uppercase; letter-spacing: 2px; }
+        button { background: #0071e3; color: white; border: none; padding: 14px; border-radius: 12px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #0077ed; }
+        .btn-alert { background: #ff3b30; }
+        .btn-alert:hover { background: #ff453a; }
+        .status { padding: 14px; border-radius: 12px; background: rgba(255,255,255,0.03); font-size: 13px; text-align: center; color: #a1a1a6; line-height: 1.5; border-left: 4px solid #0071e3; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>SecuCam Emisor</h2>
+    <video id="localVideo" autoplay playsinline muted></video>
+    
+    <div class="panel">
+        <label>Código de Transmisión (5 letras)</label>
+        <input type="text" id="camCode" maxlength="5" placeholder="SALAS" value="SALAS">
+        
+        <label>Calidad Inicial del Video</label>
+        <select id="videoQuality" onchange="actualizarCalidadLocal()">
+            <option value="baja">Baja (480p - Ahorro de Datos)</option>
+            <option value="media" selected>Media (720p - HD Estándar)</option>
+            <option value="alta">Alta (1080p - Full HD)</option>
+        </select>
+
+        <button onclick="iniciarServidor()">1. Encender y Publicar Cámara</button>
+        <button class="btn-alert" id="btnAlert" onclick="enviarAlertaMovimiento()" disabled>2. Simular Alerta de Movimiento</button>
+    </div>
+
+    <div class="status" id="txtStatus">Estado: Apagado. Configura el código y encendé la unidad.</div>
+</div>
+
+<script>
+    let localStream = null;
+    let peerNode = null;
+    let currentDataConn = null;
+
+    const resoluciones = {
+        baja: { width: 640, height: 480, fps: 15 },
+        media: { width: 1280, height: 720, fps: 24 },
+        alta: { width: 1920, height: 1080, fps: 30 }
+    };
+
+    async function activarCamara(calidadKey) {
+        const res = resoluciones[calidadKey] || resoluciones.media;
+        
+        // Si ya hay un stream corriendo, apagamos los tracks anteriores para liberar hardware
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+        }
+
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: { 
+                    facingMode: 'environment', 
+                    width: { ideal: res.width }, 
+                    height: { ideal: res.height },
+                    frameRate: { ideal: res.fps }
+                },
+                audio: true
+            });
+            document.getElementById('localVideo').srcObject = localStream;
+            return true;
+        } catch (err) {
+            actualizarEstado("Error de hardware en cámara: " + err.message);
+            return false;
+        }
+    }
+
+    async function actualizarCalidadLocal() {
+        if (!localStream) return;
+        const calidad = document.getElementById('videoQuality').value;
+        actualizarEstado(`Cambiando resolución local a modo: ${calidad.toUpperCase()}...`);
+        await activarCamara(calidad);
+        actualizarEstado(`Calidad actualizada. Si hay un visor conectado, deberá reconectar para refrescar el códec.`);
+    }
+
+    async function iniciarServidor() {
+        const codigo = document.getElementById('camCode').value.trim().toLowerCase();
+        const calidad = document.getElementById('videoQuality').value;
+        
+        if (codigo.length < 3) {
+            alert("Introduce un código de transmisión válido.");
+            return;
+        }
+
+        actualizarEstado("Inicializando captura de video...");
+        const camaraOk = await activarCamara(calidad);
+        if (!camaraOk) return;
+
+        if (peerNode) peerNode.destroy();
+
+        peerNode = new Peer('secucam-' + codigo);
+
+        peerNode.on('open', (id) => {
+            actualizarEstado(`Cámara en Línea.\nID de Red: ${id}\n\nIntroduce el código "${codigo.toUpperCase()}" en tu Dashboard.`);
+            document.getElementById('btnAlert').disabled = false;
+        });
+
+        peerNode.on('connection', (conn) => {
+            currentDataConn = conn;
+            actualizarEstado("Visor acoplado por datos. Sincronizando flujo de video...");
+
+            conn.on('data', async (data) => {
+                console.log("Comando entrante:", data);
+                
+                // Petición de llamada invertida P2P
+                if (data && data.type === 'solicitud-stream' && data.visorId) {
+                    actualizarEstado("Inyectando stream multimedia al Visor remoto...");
+                    if (localStream) {
+                        peerNode.call(data.visorId, localStream);
+                    }
+                }
+
+                // Ajuste Remoto de Calidad solicitado por el Visor
+                if (data && data.type === 'cambiar-calidad-remota') {
+                    document.getElementById('videoQuality').value = data.value;
+                    actualizarEstado(`El Visor cambió remotamente la calidad a: ${data.value.toUpperCase()}`);
+                    await activarCamara(data.value);
+                    // Le avisamos al visor que ya cambiamos de resolución para que refresque si lo requiere
+                    conn.send({ type: 'calidad-lista', value: data.value });
+                }
+
+                if (data && data.type === 'torch') {
+                    manejarLinterna(data.value);
+                }
+            });
+
+            conn.on('close', () => {
+                actualizarEstado("El Visor se desconectó. Esperando nueva reconexión...");
+            });
+        });
+
+        peerNode.on('error', (err) => {
+            if (err.type === 'unavailable-id') {
+                actualizarEstado("Error: El código ya está ocupado por otra cámara en la red.");
+            } else {
+                actualizarEstado(`Alerta de Red: ${err.type}`);
+            }
+        });
+    }
+
+    function enviarAlertaMovimiento() {
+        if (currentDataConn && currentDataConn.open) {
+            currentDataConn.send({ type: 'alert', message: '¡Movimiento detectado en zona perimetral!' });
+            actualizarEstado("Alerta de movimiento enviada al Dashboard.");
+        } else {
+            alert("No hay ningún visor conectado para recibir la alerta.");
+        }
+    }
+
+    function manejarLinterna(encender) {
+        if (!localStream) return;
+        const videoTrack = localStream.getVideoTracks()[0];
+        if (videoTrack) {
+            try {
+                videoTrack.applyConstraints({ advanced: [{ torch: encender }] }).catch(e => console.log("Linterna no soportada"));
+            } catch (e) {}
+        }
+    }
+
+    function actualizarEstado(txt) {
+        document.getElementById('txtStatus').innerText = txt;
+    }
+</script>
+</body>
+</html>

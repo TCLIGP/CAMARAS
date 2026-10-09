@@ -32,8 +32,8 @@
     <video id="localVideo" autoplay playsinline muted></video>
     
     <div class="panel">
-        <label>Código de Transmisión (5 letras)</label>
-        <input type="text" id="camCode" maxlength="5" placeholder="SALAS" value="SALAS">
+        <label>Código de Transmisión (letras/números)</label>
+        <input type="text" id="camCode" maxlength="10" placeholder="SALAS" value="SALAS">
         
         <label>Calidad Inicial del Video</label>
         <select id="videoQuality" onchange="actualizarCalidadLocal()">
@@ -53,6 +53,21 @@
     let localStream = null;
     let peerNode = null;
     let currentDataConn = null;
+    let activeVisorId = null;
+
+    function sanitizeId(str) {
+        return (str || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    }
+
+    const peerIceConfig = {
+        config: {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' },
+                { urls: 'stun:stun2.l.google.com:19302' }
+            ]
+        }
+    };
 
     const resoluciones = {
         baja: { width: 640, height: 480, fps: 15 },
@@ -63,7 +78,6 @@
     async function activarCamara(calidadKey) {
         const res = resoluciones[calidadKey] || resoluciones.media;
         
-        // Si ya hay un stream corriendo, apagamos los tracks anteriores para liberar hardware
         if (localStream) {
             localStream.getTracks().forEach(track => track.stop());
         }
@@ -71,7 +85,7 @@
         try {
             localStream = await navigator.mediaDevices.getUserMedia({
                 video: { 
-                    facingMode: 'environment', 
+                    facingMode: { ideal: 'environment' },
                     width: { ideal: res.width }, 
                     height: { ideal: res.height },
                     frameRate: { ideal: res.fps }
@@ -89,16 +103,21 @@
     async function actualizarCalidadLocal() {
         if (!localStream) return;
         const calidad = document.getElementById('videoQuality').value;
-        actualizarEstado(`Cambiando resolución local a modo: ${calidad.toUpperCase()}...`);
-        await activarCamara(calidad);
-        actualizarEstado(`Calidad actualizada. Si hay un visor conectado, deberá reconectar para refrescar el códec.`);
+        actualizarEstado(`Ajustando resolución local a: ${calidad.toUpperCase()}...`);
+        const ok = await activarCamara(calidad);
+        
+        if (ok && peerNode && activeVisorId) {
+            peerNode.call(activeVisorId, localStream);
+            actualizarEstado(`Calidad actualizada y transmisión renegociada con el Visor.`);
+        }
     }
 
     async function iniciarServidor() {
-        const codigo = document.getElementById('camCode').value.trim().toLowerCase();
+        const rawCodigo = document.getElementById('camCode').value.trim();
+        const cleanCodigo = sanitizeId(rawCodigo);
         const calidad = document.getElementById('videoQuality').value;
         
-        if (codigo.length < 3) {
+        if (cleanCodigo.length < 2) {
             alert("Introduce un código de transmisión válido.");
             return;
         }
@@ -109,10 +128,10 @@
 
         if (peerNode) peerNode.destroy();
 
-        peerNode = new Peer('secucam-' + codigo);
+        peerNode = new Peer('secucam-' + cleanCodigo, peerIceConfig);
 
         peerNode.on('open', (id) => {
-            actualizarEstado(`Cámara en Línea.\nID de Red: ${id}\n\nIntroduce el código "${codigo.toUpperCase()}" en tu Dashboard.`);
+            actualizarEstado(`Cámara en Línea.\nID de Red: ${id}\n\nIntroduce el código "${cleanCodigo.toUpperCase()}" en tu Dashboard.`);
             document.getElementById('btnAlert').disabled = false;
         });
 
@@ -121,23 +140,17 @@
             actualizarEstado("Visor acoplado por datos. Sincronizando flujo de video...");
 
             conn.on('data', async (data) => {
-                console.log("Comando entrante:", data);
-                
-                // Petición de llamada invertida P2P
                 if (data && data.type === 'solicitud-stream' && data.visorId) {
+                    activeVisorId = data.visorId;
                     actualizarEstado("Inyectando stream multimedia al Visor remoto...");
                     if (localStream) {
                         peerNode.call(data.visorId, localStream);
                     }
                 }
 
-                // Ajuste Remoto de Calidad solicitado por el Visor
                 if (data && data.type === 'cambiar-calidad-remota') {
                     document.getElementById('videoQuality').value = data.value;
-                    actualizarEstado(`El Visor cambió remotamente la calidad a: ${data.value.toUpperCase()}`);
-                    await activarCamara(data.value);
-                    // Le avisamos al visor que ya cambiamos de resolución para que refresque si lo requiere
-                    conn.send({ type: 'calidad-lista', value: data.value });
+                    await actualizarCalidadLocal();
                 }
 
                 if (data && data.type === 'torch') {
@@ -173,7 +186,7 @@
         const videoTrack = localStream.getVideoTracks()[0];
         if (videoTrack) {
             try {
-                videoTrack.applyConstraints({ advanced: [{ torch: encender }] }).catch(e => console.log("Linterna no soportada"));
+                videoTrack.applyConstraints({ advanced: [{ torch: encender }] }).catch(e => console.log("Linterna no soportada o inactiva"));
             } catch (e) {}
         }
     }
